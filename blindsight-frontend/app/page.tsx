@@ -8,6 +8,7 @@ import {
 import "@stream-io/video-react-sdk/dist/css/styles.css";
 import LandingScreen from "@/components/LandingScreen";
 import ActiveCallScreen from "@/components/ActiveCallScreen";
+import AgentAudioPlayer from "@/components/AgentAudioPlayer";
 
 const CALL_ID = "blindsight-live";
 
@@ -17,6 +18,26 @@ export default function HomePage() {
   const [connected, setConnected] = useState(false);
 
   const handleStart = useCallback(async () => {
+    // ── iOS audio unlock ─────────────────────────────────────────────────────
+    // MUST be synchronous before the first `await` — only works inside a
+    // direct user-gesture handler. Resumes the Web AudioContext so that
+    // audio elements created later (by Stream SDK) are allowed to play.
+    try {
+      const AC =
+        (window as any).AudioContext ||
+        (window as any).webkitAudioContext;
+      if (AC) {
+        const ctx = new AC() as AudioContext;
+        ctx.resume();
+        const buf = ctx.createBuffer(1, 1, 22050);
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.connect(ctx.destination);
+        src.start(0);
+      }
+    } catch (_) { /* non-fatal */ }
+    // ─────────────────────────────────────────────────────────────────────────
+
     const userId = "user-" + Math.random().toString(36).slice(2, 8);
 
     const res = await fetch(`/api/token?userId=${userId}`);
@@ -66,6 +87,13 @@ export default function HomePage() {
     setClient(videoClient);
     setCall(videoCall);
     setConnected(true);
+
+    // Trigger Stream SDK's internal AudioContext click-resume listener.
+    // The SDK adds document.addEventListener('click', resumeAudioContext)
+    // when it creates its AudioContext — dispatching a synthetic click fires it.
+    setTimeout(() => {
+      document.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    }, 500);
   }, []);
 
   const handleStop = useCallback(async () => {
@@ -86,6 +114,8 @@ export default function HomePage() {
   return (
     <StreamVideo client={client}>
       <StreamCall call={call}>
+        {/* Routes agent audio through speaker instead of iOS earpiece */}
+        <AgentAudioPlayer />
         <ActiveCallScreen onStop={handleStop} call={call} />
       </StreamCall>
     </StreamVideo>
