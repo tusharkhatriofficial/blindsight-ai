@@ -72,7 +72,7 @@ class SceneAnalysisProcessor(VideoProcessor):
         self._analyzing = False
         self._last_spoken_time = 0.0
         self._last_result_type: Optional[str] = None  # "BLOCKED" or "CLEAR"
-        self._reminder_interval = 12.0  # repeat reminder every 12s even if no change
+        self._reminder_interval = 12.0  # repeat last status every 12s as a reminder
 
     def attach_agent(self, agent) -> None:
         """Called by the framework to give access to the agent."""
