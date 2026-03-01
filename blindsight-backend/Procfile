@@ -1,0 +1,1 @@
+worker: python main.py --call-type default --call-id blindsight-live
