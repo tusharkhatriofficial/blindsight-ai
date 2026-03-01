@@ -1,6 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // Required for Docker standalone builds — emits a self-contained server.js
+  output: "standalone",
+
   async headers() {
     return [
       {
