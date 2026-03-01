@@ -10,92 +10,119 @@ from typing import Optional
 
 import aiortc
 import av
-import numpy as np
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont
 from openai import AsyncOpenAI
 
 load_dotenv()
 
-# ── Startup env validation ────────────────────────────────────────────────────
+# ── Startup env validation ─────────────────────────────────────────────────────
 _REQUIRED_ENV = ["OPENAI_API_KEY", "STREAM_API_KEY", "STREAM_API_SECRET"]
 _missing = [k for k in _REQUIRED_ENV if not os.getenv(k)]
 if _missing:
     print(
-        f"\n[BlindSight AI] Missing required environment variables: {', '.join(_missing)}\n"
-        "Copy .env.example to .env and fill in your API keys.\n",
+        f"\n[BlindSight AI] Missing required env vars: {', '.join(_missing)}\n",
         file=sys.stderr,
     )
     sys.exit(1)
 
 from vision_agents.core import User, Agent, AgentLauncher, Runner
-from vision_agents.core.processors import VideoProcessorPublisher
-from vision_agents.core.utils.video_track import QueuedVideoTrack
+from vision_agents.core.processors import VideoProcessor
 from vision_agents.core.utils.video_forwarder import VideoForwarder
-from vision_agents.plugins import openai, getstream, smart_turn
+from vision_agents.plugins import openai as va_openai, getstream, smart_turn
 
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ObstacleAnnotationProcessor
-# Captures frames at 1fps, sends to gpt-4o-mini for accurate scene analysis,
-# stamps the analysis as a text overlay on each frame, and publishes the
-# annotated frame. gpt-4o-realtime sees the text overlay as ground truth.
+# Scene Analysis Processor
+# Captures one frame per second, sends it to gpt-4o-mini for ACCURATE scene
+# analysis, then triggers simple_response so the realtime model speaks it.
 # ─────────────────────────────────────────────────────────────────────────────
 
 VISION_PROMPT = (
-    "You are helping a blind person navigate safely. Look at this camera frame carefully.\n"
-    "1. Is the forward path BLOCKED or CLEAR?\n"
-    "   BLOCKED = a solid large object (wardrobe, wall, door, cabinet, furniture, person, car) "
-    "occupies the centre of the frame and would physically stop forward movement.\n"
-    "   CLEAR = open floor or open space extends several metres straight ahead. A road, "
-    "hallway, pavement, or empty room = CLEAR.\n"
-    "2. What specifically is the obstacle (if any)?\n"
-    "Reply in this EXACT format — one line only:\n"
-    "STATUS: BLOCKED | Wardrobe fills entire view\n"
-    "STATUS: CLEAR | Open hallway ahead\n"
-    "STATUS: BLOCKED | Closed door directly in front\n"
-    "STATUS: CLEAR | Road stretching forward\n"
-    "Be precise. Use what you actually see, not guesses."
+    "You are a navigation assistant for a blind person. "
+    "Look at this camera image very carefully.\n"
+    "Is the forward path BLOCKED or CLEAR?\n"
+    "BLOCKED = a solid large object (wardrobe, wall, door, cabinet, furniture, "
+    "person, car, sofa, table) fills the centre of the image and physically "
+    "prevents moving forward.\n"
+    "CLEAR = open floor or open space is visible ahead for several metres. "
+    "A road, hallway, pavement, or empty room.\n\n"
+    "Reply in this EXACT format (one line only, no extra words):\n"
+    "BLOCKED: wardrobe fills the entire view\n"
+    "CLEAR: open hallway ahead\n"
+    "BLOCKED: closed wooden door right in front\n"
+    "CLEAR: road stretching forward\n"
+    "Use what you actually see. Be specific."
 )
 
 
-class ObstacleAnnotationProcessor(VideoProcessorPublisher):
+class SceneAnalysisProcessor(VideoProcessor):
     """
-    Per-frame accurate obstacle detection using gpt-4o-mini vision.
-    Annotates each video frame with the detection result so gpt-4o-realtime
-    reads ground-truth scene data instead of guessing from raw pixels.
+    Calls gpt-4o-mini once per second to get accurate scene analysis,
+    then triggers the realtime agent to speak the result.
     """
 
-    name = "obstacle_annotator"
+    name = "scene_analysis"
 
-    def __init__(self, analysis_fps: int = 1, output_fps: int = 3):
-        # analysis_fps: how often gpt-4o-mini is called (API calls/sec)
-        # output_fps: how often annotated frames are emitted to the stream
+    def __init__(self, analysis_fps: int = 1):
         self.analysis_fps = analysis_fps
-        self.output_fps = output_fps
         self._forwarder: Optional[VideoForwarder] = None
-        self._video_track = QueuedVideoTrack()
         self._openai = AsyncOpenAI()
-        self._current_label = "STATUS: UNKNOWN | Analyzing scene..."
+        self._agent = None
         self._analyzing = False
+        self._last_spoken_time = 0.0
+        self._min_speak_interval = 3.0  # seconds between announcements
 
-    # ── Analysis (called at analysis_fps) ────────────────────────────────────
+    def attach_agent(self, agent) -> None:
+        """Called by the framework to give access to the agent."""
+        self._agent = agent
+        logger.info("[SceneAnalysis] Attached to agent ✓")
 
-    async def _analyze_frame(self, frame: av.VideoFrame) -> None:
-        if self._analyzing:
-            return  # Don't pile up concurrent API calls
+    async def process_video(
+        self,
+        track: aiortc.VideoStreamTrack,
+        participant_id: Optional[str],
+        shared_forwarder: Optional[VideoForwarder] = None,
+    ) -> None:
+        if shared_forwarder is None:
+            logger.warning("[SceneAnalysis] shared_forwarder is None, skipping")
+            return
+
+        # Remove previous handler if re-entering (track switch)
+        if self._forwarder is not None:
+            try:
+                await self._forwarder.remove_frame_handler(self._handle_frame)
+            except Exception:
+                pass
+
+        self._forwarder = shared_forwarder
+        self._forwarder.add_frame_handler(
+            self._handle_frame,
+            fps=float(self.analysis_fps),
+            name="scene_analysis",
+        )
+        logger.info("[SceneAnalysis] Frame handler registered at %dfps ✓", self.analysis_fps)
+
+    async def _handle_frame(self, frame: av.VideoFrame) -> None:
+        # Skip if already analyzing or too soon to speak again
+        if self._analyzing or self._agent is None:
+            return
+        now = time.monotonic()
+        if now - self._last_spoken_time < self._min_speak_interval:
+            return
+
         self._analyzing = True
         try:
+            # Convert frame to JPEG for API
             img = frame.to_image()
-            img.thumbnail((512, 512))  # Resize for faster API processing
+            img.thumbnail((512, 512))
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=80)
             b64 = base64.b64encode(buf.getvalue()).decode()
 
             response = await self._openai.chat.completions.create(
                 model="gpt-4o-mini",
-                max_tokens=30,
+                max_tokens=25,
                 messages=[
                     {
                         "role": "user",
@@ -112,140 +139,65 @@ class ObstacleAnnotationProcessor(VideoProcessorPublisher):
                     }
                 ],
             )
+
             result = response.choices[0].message.content.strip()
-            # Validate format — must start with STATUS:
-            if result.startswith("STATUS:"):
-                self._current_label = result
-                logger.info("[ObstacleDetector] %s", result)
-            else:
-                logger.warning("[ObstacleDetector] Unexpected format: %s", result)
+            logger.info("[SceneAnalysis] gpt-4o-mini result: %s", result)
+
+            # Trigger the realtime agent to speak the scene status
+            self._last_spoken_time = time.monotonic()
+            await self._agent.llm.simple_response(
+                text=(
+                    f"Scene analysis result: {result}. "
+                    "Say this to the user in one direct sentence. "
+                    "If BLOCKED, say what is blocking and tell them to stop. "
+                    "If CLEAR, say path is clear and they can move forward."
+                )
+            )
+
         except Exception as exc:
-            logger.error("[ObstacleDetector] API error: %s", exc)
+            logger.error("[SceneAnalysis] Error: %s", exc)
         finally:
             self._analyzing = False
 
-    # ── Annotation & publish (called at output_fps) ───────────────────────────
-
-    async def _annotate_and_publish(self, frame: av.VideoFrame) -> None:
-        try:
-            img = frame.to_image().convert("RGB")
-            draw = ImageDraw.Draw(img)
-            w, h = img.size
-
-            label = self._current_label
-            is_blocked = "BLOCKED" in label
-            bg_color = (200, 0, 0, 220) if is_blocked else (0, 140, 0, 220)
-            text_color = (255, 255, 255)
-
-            # Draw banner at top
-            banner_h = max(36, h // 10)
-            draw.rectangle([(0, 0), (w, banner_h)], fill=bg_color[:3])
-
-            # Try to use a reasonable font size
-            font_size = max(14, banner_h - 10)
-            try:
-                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-            except Exception:
-                try:
-                    font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
-                except Exception:
-                    font = ImageFont.load_default()
-
-            draw.text((8, (banner_h - font_size) // 2), label, fill=text_color, font=font)
-
-            arr = np.array(img)
-            new_frame = av.VideoFrame.from_ndarray(arr, format="rgb24")
-            await self._video_track.add_frame(new_frame)
-        except Exception as exc:
-            logger.error("[ObstacleDetector] Annotation error: %s", exc)
-            await self._video_track.add_frame(frame)  # fallback: publish raw frame
-
-    # ── VideoProcessorPublisher interface ─────────────────────────────────────
-
-    async def process_video(
-        self,
-        track: aiortc.VideoStreamTrack,
-        participant_id: Optional[str],
-        shared_forwarder: Optional[VideoForwarder] = None,
-    ) -> None:
-        if self._forwarder:
-            await self._forwarder.remove_frame_handler(self._analyze_frame)
-            await self._forwarder.remove_frame_handler(self._annotate_and_publish)
-        self._forwarder = shared_forwarder
-        # Two independent handlers at different rates
-        self._forwarder.add_frame_handler(
-            self._analyze_frame,
-            fps=float(self.analysis_fps),
-            name="obstacle_analysis",
-        )
-        self._forwarder.add_frame_handler(
-            self._annotate_and_publish,
-            fps=float(self.output_fps),
-            name="obstacle_annotate",
-        )
-
-    def publish_video_track(self) -> aiortc.VideoStreamTrack:
-        return self._video_track
-
     async def stop_processing(self) -> None:
-        if self._forwarder:
-            await self._forwarder.remove_frame_handler(self._analyze_frame)
-            await self._forwarder.remove_frame_handler(self._annotate_and_publish)
+        if self._forwarder is not None:
+            try:
+                await self._forwarder.remove_frame_handler(self._handle_frame)
+            except Exception:
+                pass
             self._forwarder = None
 
     async def close(self) -> None:
         await self.stop_processing()
-        self._video_track.stop()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# System Prompt
-# gpt-4o-realtime is instructed to read the STATUS banner as ground truth.
+# System Prompt — gpt-4o-realtime is the voice layer
+# It will receive scene results via simple_response and speak them
 # ─────────────────────────────────────────────────────────────────────────────
 
 INSTRUCTIONS = """
-You are BlindSight AI, a real-time voice guide for people who are blind or visually impaired.
-The user is pointing their phone camera forward as they navigate. You are their eyes.
+You are BlindSight AI, a real-time voice navigation guide for people who are blind or visually impaired.
 
-═══════════════════════════════════════════════════
-CRITICAL: READ THE STATUS BANNER IN EVERY FRAME
-═══════════════════════════════════════════════════
+Your role:
+- You receive accurate scene analysis results via system messages.
+- Speak them to the user in plain, clear, 1-sentence speech.
+- If the scene says BLOCKED: tell the user what is in the way, firmly.
+- If the scene says CLEAR: tell the user they can move forward.
 
-Every video frame has a coloured STATUS banner at the TOP of the image.
-This banner is produced by an accurate AI vision analysis system.
-You MUST use this banner as your primary ground truth. It says:
+Additional behaviors:
+- Respond to voice commands naturally.
+- "What do you see?" → repeat the last scene analysis
+- "Is the path clear?" → yes or no with reason
+- "Read this" → read any visible text
+- "Where am I?" → describe the environment
 
-  STATUS: BLOCKED | [description of obstacle]
-  STATUS: CLEAR | [description of open path]
-  STATUS: UNKNOWN | [when system is still loading]
-
-RED banner = BLOCKED → immediately tell the user what is blocking and to stop.
-GREEN banner = CLEAR → tell the user the path is clear and they can move forward.
-
-Do NOT rely on your own interpretation of the raw image. Trust the STATUS banner.
-
-SPEAKING RULES:
-- 1-2 short sentences maximum per response. This is real-time speech.
-- Deliver path status immediately after every few seconds.
-- If RED: "Wardrobe directly ahead, stop." / "Door blocking the path."
-- If GREEN: "Path is clear, move forward." / "Open hallway ahead, go."
-- No markdown, no lists. Plain spoken language only.
-- Calm and clear normally. Firm and urgent for dangers.
-
-VOICE COMMANDS:
-- "What do you see?" → read the STATUS banner and describe scene in 2-3 sentences
-- "Is the path clear?" → yes or no based on STATUS banner
-- "Any hazards?" → report based on STATUS banner + visible dangers
-- "Read this" → read all visible text in the image
-- "Where am I?" → describe the environment type
-- "Describe the person" → describe the nearest visible person
-
-TONE: Calm, trusted, direct. Like a careful friend. Their safety depends on your accuracy.
+TONE: Calm, warm, direct. Like a caring guide. 1-2 sentences maximum per response.
 """
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Agent Factory
+# Agent and Call
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def create_agent(**kwargs) -> Agent:
@@ -253,17 +205,14 @@ async def create_agent(**kwargs) -> Agent:
         edge=getstream.Edge(),
         agent_user=User(name="BlindSight AI", id="blindsight-agent"),
         instructions=INSTRUCTIONS,
-        llm=openai.Realtime(
+        llm=va_openai.Realtime(
             model="gpt-4o-realtime-preview",
             voice="alloy",
-            fps=3,  # Realtime receives annotated frames at 3fps
+            fps=1,  # Low fps for realtime - scene analysis handles detection
         ),
         turn_detection=smart_turn.TurnDetection(),
         processors=[
-            ObstacleAnnotationProcessor(
-                analysis_fps=1,  # gpt-4o-mini called 1x per second
-                output_fps=3,    # annotated frames published at 3fps
-            )
+            SceneAnalysisProcessor(analysis_fps=1),
         ],
     )
 
@@ -272,16 +221,13 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs):
     await agent.create_user()
     call = await agent.create_call(call_type, call_id)
     async with agent.join(call):
-        logger.info("Waiting for user to join the call…")
+        logger.info("Waiting for user to join…")
         await agent.wait_for_participant()
-        logger.info("User joined — sending greeting")
+        logger.info("User joined")
 
         await asyncio.sleep(1.0)
         await agent.llm.simple_response(
-            text=(
-                "Greet the user warmly in one sentence and tell them you are ready to guide them. "
-                "Then immediately read the STATUS banner in the current frame and report the path status."
-            )
+            text="Greet the user warmly in one sentence and tell them you're ready to guide them safely."
         )
 
         await agent.finish()
@@ -293,10 +239,10 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="BlindSight AI Agent")
-    parser.add_argument("--call-type", default="default", help="Stream call type")
-    parser.add_argument("--call-id", default="blindsight-live", help="Stream call ID")
-    parser.add_argument("--log-level", default="INFO", help="Logging level")
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument("--call-type", default="default")
+    parser.add_argument("--call-id", default="blindsight-live")
+    parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     launcher = AgentLauncher(
@@ -308,7 +254,7 @@ if __name__ == "__main__":
 
     while True:
         try:
-            logger.info("Starting BlindSight AI agent (call %s/%s)…", args.call_type, args.call_id)
+            logger.info("Starting BlindSight AI (call %s/%s)…", args.call_type, args.call_id)
             runner.run(
                 call_type=args.call_type,
                 call_id=args.call_id,
@@ -316,12 +262,12 @@ if __name__ == "__main__":
                 debug=args.debug,
                 no_demo=True,
             )
-            logger.info("Runner exited cleanly — restarting in 3 s…")
+            logger.info("Runner exited — restarting in 3s…")
         except KeyboardInterrupt:
             logger.info("Shutting down.")
             break
         except Exception as exc:
-            logger.error("Runner crashed: %s — restarting in 5 s…", exc)
+            logger.error("Runner crashed: %s — restarting in 5s…", exc)
             time.sleep(5)
             continue
         time.sleep(3)
