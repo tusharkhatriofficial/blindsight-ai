@@ -84,18 +84,19 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs):
     await agent.create_user()
     call = await agent.create_call(call_type, call_id)
     async with agent.join(call):
-        # Brief pause so the audio channel is ready, then greet + describe
-        await asyncio.sleep(1.5)
+        # Block until the real user joins — no timeout, wait as long as needed
+        logger.info("Waiting for user to join the call…")
+        await agent.wait_for_participant()
+        logger.info("User joined — sending greeting")
+
+        # Small pause so the audio channel is fully established
+        await asyncio.sleep(1.0)
         await agent.llm.simple_response(
             text="Greet the user in one warm sentence and tell them you are ready to be their eyes. Then immediately describe what you currently see in the camera feed."
         )
-        # Stay in the call indefinitely — the Runner will cancel this coroutine
-        # when the process is stopped (SIGTERM/SIGINT), which cleanly exits the
-        # `async with agent.join(call):` block and leaves the call gracefully.
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            pass
+
+        # Stay in the call until it ends naturally (user stops or process killed)
+        await agent.finish()
 
 
 if __name__ == "__main__":
@@ -106,11 +107,15 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     args = parser.parse_args()
 
-    launcher = AgentLauncher(create_agent=create_agent, join_call=join_call)
+    # agent_idle_timeout=0 → never auto-kick the agent for being alone;
+    # it will stay until the user connects (or the process is stopped).
+    launcher = AgentLauncher(
+        create_agent=create_agent,
+        join_call=join_call,
+        agent_idle_timeout=0,
+    )
     runner = Runner(launcher)
 
-    # Supervisor loop: restart automatically if the runner exits unexpectedly
-    # (e.g. Stream disconnects, idle timeout, transient network error).
     import time
     while True:
         try:
