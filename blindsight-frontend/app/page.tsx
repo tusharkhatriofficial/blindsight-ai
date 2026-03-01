@@ -14,6 +14,7 @@ const CALL_ID = "blindsight-live";
 export default function HomePage() {
   const [client, setClient] = useState<StreamVideoClient | null>(null);
   const [call, setCall] = useState<ReturnType<StreamVideoClient["call"]> | null>(null);
+  const [connected, setConnected] = useState(false);
 
   const handleStart = useCallback(async () => {
     const userId = "user-" + Math.random().toString(36).slice(2, 8);
@@ -64,16 +65,21 @@ export default function HomePage() {
 
     setClient(videoClient);
     setCall(videoCall);
+    setConnected(true);
   }, []);
 
   const handleStop = useCallback(async () => {
+    // Unmount the call UI first so SDK hooks don't fire during teardown
+    setConnected(false);
+    // Small tick to let React unmount CameraView / ActiveCallScreen
+    await new Promise((r) => setTimeout(r, 50));
     await call?.leave();
     await client?.disconnectUser();
     setClient(null);
     setCall(null);
   }, [call, client]);
 
-  if (!client || !call) {
+  if (!connected || !client || !call) {
     return <LandingScreen onStart={handleStart} />;
   }
 

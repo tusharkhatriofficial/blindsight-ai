@@ -4,9 +4,7 @@ import {
   HStack,
   Text,
   Circle,
-  VStack,
 } from "@chakra-ui/react";
-import { useCallStateHooks } from "@stream-io/video-react-sdk";
 import { useState } from "react";
 import CameraView from "./CameraView";
 
