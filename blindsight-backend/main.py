@@ -71,7 +71,8 @@ class SceneAnalysisProcessor(VideoProcessor):
         self._agent = None
         self._analyzing = False
         self._last_spoken_time = 0.0
-        self._min_speak_interval = 3.0  # seconds between announcements
+        self._last_result_type: Optional[str] = None  # "BLOCKED" or "CLEAR"
+        self._reminder_interval = 12.0  # repeat reminder every 12s even if no change
 
     def attach_agent(self, agent) -> None:
         """Called by the framework to give access to the agent."""
@@ -143,16 +144,27 @@ class SceneAnalysisProcessor(VideoProcessor):
             result = response.choices[0].message.content.strip()
             logger.info("[SceneAnalysis] gpt-4o-mini result: %s", result)
 
-            # Trigger the realtime agent to speak the scene status
-            self._last_spoken_time = time.monotonic()
-            await self._agent.llm.simple_response(
-                text=(
-                    f"Scene analysis result: {result}. "
-                    "Say this to the user in one direct sentence. "
-                    "If BLOCKED, say what is blocking and tell them to stop. "
-                    "If CLEAR, say path is clear and they can move forward."
-                )
-            )
+            # Determine result type
+            if result.startswith("BLOCKED"):
+                result_type = "BLOCKED"
+                detail = result[len("BLOCKED:"):].strip() if ":" in result else result
+                spoken = f"Say exactly this to the user, nothing else: '{detail}, stop.'"
+            elif result.startswith("CLEAR"):
+                result_type = "CLEAR"
+                detail = result[len("CLEAR:"):].strip() if ":" in result else result
+                spoken = f"Say exactly this to the user, nothing else: 'Path is clear, {detail}, move forward.'"
+            else:
+                return  # Unexpected format, skip
+
+            now = time.monotonic()
+            type_changed = result_type != self._last_result_type
+            time_since_last = now - self._last_spoken_time
+
+            # Speak only if scene changed OR reminder interval elapsed
+            if type_changed or time_since_last >= self._reminder_interval:
+                self._last_result_type = result_type
+                self._last_spoken_time = now
+                await self._agent.llm.simple_response(text=spoken)
 
         except Exception as exc:
             logger.error("[SceneAnalysis] Error: %s", exc)
