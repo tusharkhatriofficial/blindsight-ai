@@ -84,11 +84,18 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs):
     await agent.create_user()
     call = await agent.create_call(call_type, call_id)
     async with agent.join(call):
+        # Brief pause so the audio channel is ready, then greet + describe
         await asyncio.sleep(1.5)
         await agent.llm.simple_response(
             text="Greet the user in one warm sentence and tell them you are ready to be their eyes. Then immediately describe what you currently see in the camera feed."
         )
-        await agent.finish()
+        # Stay in the call indefinitely — the Runner will cancel this coroutine
+        # when the process is stopped (SIGTERM/SIGINT), which cleanly exits the
+        # `async with agent.join(call):` block and leaves the call gracefully.
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
@@ -101,10 +108,26 @@ if __name__ == "__main__":
 
     launcher = AgentLauncher(create_agent=create_agent, join_call=join_call)
     runner = Runner(launcher)
-    runner.run(
-        call_type=args.call_type,
-        call_id=args.call_id,
-        log_level=args.log_level,
-        debug=args.debug,
-        no_demo=True,  # headless — no browser UI on Heroku
-    )
+
+    # Supervisor loop: restart automatically if the runner exits unexpectedly
+    # (e.g. Stream disconnects, idle timeout, transient network error).
+    import time
+    while True:
+        try:
+            logger.info("Starting BlindSight AI agent (call %s/%s)…", args.call_type, args.call_id)
+            runner.run(
+                call_type=args.call_type,
+                call_id=args.call_id,
+                log_level=args.log_level,
+                debug=args.debug,
+                no_demo=True,
+            )
+            logger.info("Runner exited cleanly — restarting in 3 s…")
+        except KeyboardInterrupt:
+            logger.info("Shutting down.")
+            break
+        except Exception as exc:
+            logger.error("Runner crashed: %s — restarting in 5 s…", exc)
+            time.sleep(5)
+            continue
+        time.sleep(3)
