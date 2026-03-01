@@ -7,6 +7,8 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.134.0",
     "gunicorn>=25.1.0",
+    "numpy>=2.2.6",
+    "pillow>=12.1.1",
     "python-dotenv>=1.2.1",
     "uvicorn>=0.41.0",
     "vision-agents[getstream,openai,smart-turn]>=0.3.8",
