@@ -30,10 +30,37 @@ export default function HomePage() {
     const videoCall = videoClient.call("default", CALL_ID);
     await videoCall.join({ create: true });
 
-    // Use rear-facing camera for navigation
-    await videoCall.camera.selectDirection("back");
-    await videoCall.camera.enable();
-    await videoCall.microphone.enable();
+    // Enable mic first — works over HTTP
+    try {
+      await videoCall.microphone.enable();
+    } catch (e) {
+      console.warn("Microphone enable failed:", e);
+    }
+
+    // Camera requires a secure context (HTTPS) on iOS Safari
+    // Attempt rear-facing; surface a readable error if blocked
+    try {
+      await videoCall.camera.selectDirection("back");
+      await videoCall.camera.enable();
+    } catch (e: any) {
+      const msg: string = e?.message ?? String(e);
+      // Re-throw with a clear message so LandingScreen can display it
+      if (
+        msg.toLowerCase().includes("permission") ||
+        msg.toLowerCase().includes("notallowed") ||
+        msg.toLowerCase().includes("https") ||
+        msg.toLowerCase().includes("secure") ||
+        msg.toLowerCase().includes("not supported")
+      ) {
+        await videoCall.leave();
+        await videoClient.disconnectUser();
+        throw new Error(
+          "Camera permission denied. On iPhone Safari, HTTPS is required. Open the app via your Vercel URL instead."
+        );
+      }
+      // Non-fatal: join without camera
+      console.warn("Camera enable failed (non-fatal):", e);
+    }
 
     setClient(videoClient);
     setCall(videoCall);
